@@ -1,3 +1,6 @@
+from typing import Optional
+import numpy as np
+
 import jax.numpy as jnp
 import flax.linen as nn
 
@@ -5,77 +8,75 @@ from mlstm_cell import mLSTMCell
 
 
 class mLSTMLayer(nn.Module):
-    """mLSTM layer.
+    """mLSTM layer from xLSTM paper (https://arxiv.org/abs/2405.04517).
 
     Attributes:
         embedding_dim: number of output features
-        hidden_dim: number of hidden features, usually ~1.3 * embedding_dim
         num_heads: number of attention heads
         context_length: sequence length of the input
+        num_blocks: number of blocks in the model, used for weight initialization
+        hidden_dim: number of hidden features. If None (default), it will be set
+            to ~1.3 * embedding_dim
         conv1d_kernel_size: kernel size of the causal 1D convolution
         qkv_proj_blocksize: blocksize of the linear projections
         bias: whether to use bias in the linear layers
-        num_blocks: number of blocks in the model, used for weight initialization
     """
 
     embedding_dim: int
-    hidden_dim: int
     num_heads: int
     context_length: int
+    num_blocks: int = 1
+    hidden_dim: Optional[int] = None
     conv1d_kernel_size: int = 4
     qkv_proj_blocksize: int = 4
     bias: bool = False
-    num_blocks: int = 1
 
     @nn.compact
     def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
+        """Apply the mLSTM layer.
+
+        Args:
+            x: Input tensor of shape (B, S, E)
+
+        Returns:
+            Output tensor of shape (B, S, E)
+        """
+        hidden_dim = self.hidden_dim
+        if self.hidden_dim is None:
+            hidden_dim = calculate_proj_up_dim(self.embedding_dim)
+
         x_inner = nn.Dense(
-            features=2 * self.hidden_dim,
-            use_bias=self.bias,
-            kernel_init=small_init(x.shape[-1]),
+            features=2 * hidden_dim, use_bias=self.bias, kernel_init=small_init(x.shape[-1])
         )(x)
 
         x_mlstm, z = jnp.split(x_inner, 2, axis=-1)
 
         x_mlstm_conv = CausalConv1d(
-            feature_dim=self.hidden_dim,
+            feature_dim=hidden_dim,
             kernel_size=self.conv1d_kernel_size,
             causal_conv_bias=True,
             channel_mixing=False,
         )(x_mlstm)
         x_mlstm_conv_act = nn.silu(x_mlstm_conv)
 
-        num_proj_heads = round(self.hidden_dim // self.qkv_proj_blocksize)
+        num_proj_heads = round(hidden_dim // self.qkv_proj_blocksize)
         q = LinearHeadwiseExpand(
-            in_features=self.hidden_dim,
-            num_heads=num_proj_heads,
-            expand_factor_up=1.0,
-            bias=self.bias,
+            in_features=hidden_dim, num_heads=num_proj_heads, expand_factor_up=1.0, bias=self.bias
         )(x_mlstm_conv_act)
 
         k = LinearHeadwiseExpand(
-            in_features=self.hidden_dim,
-            num_heads=num_proj_heads,
-            expand_factor_up=1.0,
-            bias=self.bias,
+            in_features=hidden_dim, num_heads=num_proj_heads, expand_factor_up=1.0, bias=self.bias
         )(x_mlstm_conv_act)
 
         v = LinearHeadwiseExpand(
-            in_features=self.hidden_dim,
-            num_heads=num_proj_heads,
-            expand_factor_up=1.0,
-            bias=self.bias,
+            in_features=hidden_dim, num_heads=num_proj_heads, expand_factor_up=1.0, bias=self.bias
         )(x_mlstm)
 
         h_tilde_state = mLSTMCell(
-            embedding_dim=self.hidden_dim,
-            num_heads=self.num_heads,
-            context_length=self.context_length,
+            embedding_dim=hidden_dim, num_heads=self.num_heads, context_length=self.context_length
         )(q, k, v)
 
-        learnable_skip = self.param(
-            "learnable_skip", nn.initializers.ones_init(), (self.hidden_dim,)
-        )
+        learnable_skip = self.param("learnable_skip", nn.initializers.ones_init(), (hidden_dim,))
         h_tilde_state_skip = h_tilde_state + (learnable_skip * x_mlstm_conv_act)
 
         h_state = h_tilde_state_skip * nn.silu(z)
@@ -115,11 +116,7 @@ class LinearHeadwiseExpand(nn.Module):
             self.param(
                 "weight",
                 small_init(self.in_features // self.num_heads),
-                (
-                    self.num_heads,
-                    self.in_features // self.num_heads,
-                    out_features_per_head,
-                ),
+                (self.num_heads, self.in_features // self.num_heads, out_features_per_head),
             )
             if self.trainable_weight
             else jnp.zeros(...)
@@ -161,3 +158,17 @@ class CausalConv1d(nn.Module):
         )(x)
 
         return y
+
+
+def calculate_proj_up_dim(
+    embedding_dim: int, proj_factor: float = 1.3, round_up: bool = True, multiple_of: int = 64
+) -> int:
+    proj_up_dim = proj_factor * embedding_dim
+    multiple_of_multiplier = proj_up_dim / multiple_of
+
+    if round_up:
+        multiple_of_multiplier = np.ceil(multiple_of_multiplier)
+    else:
+        multiple_of_multiplier = np.floor(multiple_of_multiplier)
+
+    return int(multiple_of_multiplier * multiple_of)

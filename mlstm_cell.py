@@ -12,31 +12,26 @@ def parallel_stabilized_simple(
     stabilize_rowwise: bool = True,
     eps: float = 1e-6,
 ) -> jnp.ndarray:
-    """mLSTM cell in parallel form (JAX version)."""
+    """mLSTM cell in parallel form."""
     S, DH = queries.shape
 
-    log_fgates = jax.nn.log_sigmoid(fgate_preact)  # (S, 1)
+    log_fgates = jax.nn.log_sigmoid(fgate_preact)
     log_fgates_cumsum = jnp.concatenate(
-        [jnp.zeros((1, 1), dtype=log_fgates.dtype), jnp.cumsum(log_fgates, axis=0)],
-        axis=0,
-    )  # (S+1, 1)
+        [jnp.zeros((1, 1), dtype=log_fgates.dtype), jnp.cumsum(log_fgates, axis=0)], axis=0
+    )
 
     log_D_matrix = jnp.where(
         jnp.tri(S, k=0, dtype=bool),
         (log_fgates_cumsum - log_fgates_cumsum.T)[1:, 1:] + igate_preact.T,
         _get_large_negative(log_fgates_cumsum.dtype),
-    )  # (S, S)
+    )
 
-    max_log_D = jnp.max(
-        log_D_matrix, axis=-1 if stabilize_rowwise else None, keepdims=True
-    )  # (S, 1) or (1, 1)
+    max_log_D = jnp.max(log_D_matrix, axis=-1 if stabilize_rowwise else None, keepdims=True)
 
     D_matrix = jnp.exp(log_D_matrix - max_log_D)
     C_matrix = (queries @ (keys.T / jnp.sqrt(DH))) * D_matrix
 
-    normalizer = jnp.maximum(
-        jnp.sum(C_matrix, axis=-1, keepdims=True), jnp.exp(-max_log_D)
-    )
+    normalizer = jnp.maximum(jnp.sum(C_matrix, axis=-1, keepdims=True), jnp.exp(-max_log_D))
 
     return (C_matrix / (normalizer + eps)) @ values
 
@@ -83,36 +78,28 @@ class mLSTMCell(nn.Module):
         )
 
         if_gate_input = jnp.concatenate((q, k, v), axis=-1)
-        igate_preact = igate(if_gate_input)  # (B, S, NH)
-        igate_preact = igate_preact.mT[..., None]  # (B, NH, S, 1)
-        fgate_preact = fgate(if_gate_input)  # (B, S, NH)
-        fgate_preact = fgate_preact.mT[..., None]  # (B, NH, S, 1)
+        igate_preact = igate(if_gate_input).mT[..., None]
+        fgate_preact = fgate(if_gate_input).mT[..., None]
 
         q = q.reshape(B, S, self.num_heads, head_dim).swapaxes(-2, -3)
         k = k.reshape(B, S, self.num_heads, head_dim).swapaxes(-2, -3)
         v = v.reshape(B, S, self.num_heads, head_dim).swapaxes(-2, -3)
 
         h_state = jax.vmap(jax.vmap(parallel_stabilized_simple))(
-            queries=q,
-            keys=k,
-            values=v,
-            igate_preact=igate_preact,
-            fgate_preact=fgate_preact,
-        )  # (B, NH, S, DH)
+            queries=q, keys=k, values=v, igate_preact=igate_preact, fgate_preact=fgate_preact
+        )
 
         h_state = RMSNorm()(h_state)
 
-        h_state = h_state.swapaxes(-3, -2)  # (B, S, NH, DH)
-        h_state = h_state.reshape(B, S, self.embedding_dim)  # (B, S, H)
+        h_state = h_state.swapaxes(-3, -2)
+        h_state = h_state.reshape(B, S, self.embedding_dim)
 
         return h_state
 
 
 def bias_linspace_init(start: float = 3.0, end: float = 6.0):
     def init(_, shape, *args):
-        assert (
-            len(shape) == 1
-        ), f"param must be 1-dimensional (typically a bias), got {len(shape)}"
+        assert len(shape) == 1, f"param must be 1-dimensional (typically a bias), got {len(shape)}"
         return jnp.linspace(start, end, shape[0])
 
     return init
